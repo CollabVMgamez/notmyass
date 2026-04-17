@@ -238,7 +238,7 @@ install_dependencies() {
 	local missing_packages=0
 
 	install_tinycore_package() {
-		if run_as_root tce-load -wi "$1"; then
+		if tce-load -wi "$1"; then
 			return 0
 		fi
 
