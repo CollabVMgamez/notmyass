@@ -225,6 +225,10 @@ static const char *kOpenrcModulesPath = "/etc/conf.d/modules";
 #define INSTALL_CONFIRM_TEXT "INSTALL MYASS"
 
 static int command_exists( const char *command );
+static int file_exists( const char *path );
+static int run_shell( const char *cmd );
+static int run_shell_capture_stderr( const char *cmd );
+static int write_text_file( const char *path, const char *content );
 
 static int
 enable_openrc_boot_module( void )
