@@ -1,4 +1,6 @@
-KERNEL_DIR ?= /usr/src/linux-headers-$(shell uname -r)
+KERNEL_DIR_DEFAULT := /usr/src/linux-headers-$(shell uname -r)
+KERNEL_DIR_FALLBACK := /lib/modules/$(shell uname -r)/build
+KERNEL_DIR ?= $(if $(wildcard $(KERNEL_DIR_FALLBACK)), $(KERNEL_DIR_FALLBACK), $(KERNEL_DIR_DEFAULT))
 APP_SRCDIR := exe
 DRIVER_SRCDIR := sys
 PKG_SRCDIR := package
@@ -90,6 +92,17 @@ musl: build-driver build-app-musl
 
 clean:
 	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR)/$(DRIVER_SRCDIR) clean
+	rm -f \
+		$(DRIVER_SRCDIR)/myass.o \
+		$(DRIVER_SRCDIR)/myass.ko \
+		$(DRIVER_SRCDIR)/myass.mod \
+		$(DRIVER_SRCDIR)/myass.mod.c \
+		$(DRIVER_SRCDIR)/myass.mod.o \
+		$(DRIVER_SRCDIR)/myass.mod.symvers \
+		$(DRIVER_SRCDIR)/Module.symvers \
+		$(DRIVER_SRCDIR)/modules.order \
+		$(DRIVER_SRCDIR)/.tmp_versions/*.*
+	rm -f $(APP_SRCDIR)/*.o
 	rm -f $(APP_BIN) $(APP_BIN_MUSL)
 	rm -rf $(PKG_SRCDIR)
 	rm -rf $(PKG_MUSL_DIR)

@@ -1083,6 +1083,17 @@ load_bundled_modules( void )
 static int
 ensure_driver_loaded( int install_if_missing )
 {
+    if ( install_if_missing ) {
+        fprintf( stderr, "Attempting explicit persistent install...\n" );
+        if ( install_driver_permanently() ) {
+            return access( kDriverPath, F_OK ) == 0;
+        }
+        fprintf(
+            stderr,
+            "Persistent install did not complete, falling back to transient load path.\n"
+        );
+    }
+
     if ( access( kDriverPath, F_OK ) == 0 ) {
         return 1;
     }
@@ -1101,13 +1112,6 @@ ensure_driver_loaded( int install_if_missing )
 
     if ( load_bundled_modules() ) {
         return access( kDriverPath, F_OK ) == 0;
-    }
-
-    if ( install_if_missing ) {
-        fprintf( stderr, "Attempting explicit persistent install...\n" );
-        if ( install_driver_permanently() ) {
-            return access( kDriverPath, F_OK ) == 0;
-        }
     }
 
     {
