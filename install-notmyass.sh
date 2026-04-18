@@ -5,6 +5,9 @@ set -eu
 REPO_URL="https://github.com/CollabVMgamez/notmyass.git"
 INSTALL_DIR="${NOTMYASS_INSTALL_DIR:-/opt}"
 REPO_DIR="${INSTALL_DIR}/notmyass"
+PATH_TARGET="/usr/local/bin/myass"
+PATH_TARGET="/usr/bin/myass"
+USE_MUSL_BUILD=0
 
 if [ "$(id -u)" -eq 0 ]; then
         SUDO=""
@@ -60,9 +63,51 @@ install_git() {
         exit 1
 }
 
+detect_path_binary() {
+        if [ "${USE_MUSL_BUILD}" -eq 1 ] && [ -x "${REPO_DIR}/package-musl/myass-musl" ]; then
+                printf '%s' "${REPO_DIR}/package-musl/myass-musl"
+                return
+        fi
+
+        if [ -x "${REPO_DIR}/package/myass" ]; then
+                printf '%s' "${REPO_DIR}/package/myass"
+                return
+        fi
+
+        if [ -x "${REPO_DIR}/package-musl/myass-musl" ]; then
+                printf '%s' "${REPO_DIR}/package-musl/myass-musl"
+                return
+        fi
+
+        printf '%s' "${REPO_DIR}/exe/myass"
+}
+
+link_myass_to_path() {
+        local bin
+        bin="$(detect_path_binary)"
+
+        if [ ! -x "${bin}" ]; then
+                echo "Built binary not found at ${bin}; skipping PATH update."
+                return
+        fi
+
+        ${SUDO} mkdir -p /usr/bin
+        ${SUDO} ln -sf "${bin}" "${PATH_TARGET}"
+        echo "Added myass command to PATH: ${PATH_TARGET}"
+        echo "Run: myass"
+}
+
 main() {
         ${SUDO} mkdir -p "${INSTALL_DIR}"
         ${SUDO} rm -rf "${REPO_DIR}"
+
+        for arg in "$@"; do
+                case "${arg}" in
+                        --musl)
+                                USE_MUSL_BUILD=1
+                                ;;
+                esac
+        done
 
         install_git
         ${SUDO} git clone "${REPO_URL}" "${REPO_DIR}"
@@ -70,6 +115,7 @@ main() {
         cd "${REPO_DIR}"
         ${SUDO} chmod +x autoinstaller.sh
         ${SUDO} ./autoinstaller.sh "$@"
+        link_myass_to_path
 }
 
 main "$@"
