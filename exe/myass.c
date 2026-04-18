@@ -206,9 +206,11 @@ static const char *kDriverPath = "/dev/myass";
 static const char *kWindowTitle = "Not My ASS";
 static const char *kModuleName = "myass.ko";
 static const char *kDkmsModuleName = "myass";
-static const char *kDkmsModuleVersion = "1.0";
+static const char *kDkmsModuleVersion = "1.0.1";
 static const char *kDkmsSrcBase = "/usr/src";
 static const char *kDkmsConfName = "dkms.conf";
+static const char *kModulesLoadPath = "/etc/modules-load.d/myass.conf";
+static const char *kOpenrcModulesPath = "/etc/conf.d/modules";
 
 #define GUI_BTN_CRASH_X 25
 #define GUI_BTN_CRASH_Y 30
@@ -223,6 +225,120 @@ static const char *kDkmsConfName = "dkms.conf";
 #define INSTALL_CONFIRM_TEXT "INSTALL MYASS"
 
 static int command_exists( const char *command );
+
+static int
+enable_openrc_boot_module( void )
+{
+    char cmd[ SHELL_CMD_MAX ];
+
+    if ( !file_exists( kOpenrcModulesPath ) ) {
+        return 0;
+    }
+
+    if ( !command_exists( "grep" ) ) {
+        fprintf(
+            stderr,
+            "Cannot configure OpenRC autoload: grep command unavailable.\n"
+        );
+        return 0;
+    }
+
+    if ( command_exists( "sed" ) ) {
+        snprintf(
+            cmd,
+            sizeof( cmd ),
+            "if grep -Eq '(^|[[:space:]])myass([[:space:]]|$)' '%s'; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "if grep -Eq '^[[:space:]]*modules[[:space:]]*=' '%s'; then\n"
+            "  sed -i -E 's/^([[:space:]]*modules[[:space:]]*=)\"([^\"]*)\"$/\\1\"\\2 myass\"/; "
+            "t; s/^([[:space:]]*modules[[:space:]]*=)(.*)$/\\1\"\\2 myass\"/' '%s'\n"
+            "else\n"
+            "  printf '\\nmodules=\"myass\"\\n' >> '%s'\n"
+            "fi\n"
+            "grep -Eq '(^|[[:space:]])myass([[:space:]]|$)' '%s'",
+            kOpenrcModulesPath,
+            kOpenrcModulesPath,
+            kOpenrcModulesPath,
+            kOpenrcModulesPath,
+            kOpenrcModulesPath
+        );
+        if ( run_shell_capture_stderr( cmd ) ) {
+            fprintf(
+                stderr,
+                "Registered myass in OpenRC module list: %s\n",
+                kOpenrcModulesPath
+            );
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int
+enable_boot_module_autoload( void )
+{
+    char cmd[ SHELL_CMD_MAX ];
+
+    if ( !command_exists( "mkdir" ) || !command_exists( "sh" ) ) {
+        fprintf(
+            stderr,
+            "Cannot configure boot autoload because mkdir/sh are unavailable.\n"
+        );
+        return 0;
+    }
+
+    if ( !file_exists( "/etc/modules-load.d" ) ) {
+        snprintf( cmd, sizeof( cmd ), "mkdir -p /etc/modules-load.d" );
+        if ( !run_shell( cmd ) ) {
+            fprintf(
+                stderr,
+                "Could not create /etc/modules-load.d; trying /etc/modules fallback.\n"
+            );
+        }
+    }
+
+    if ( write_text_file( kModulesLoadPath, "myass\n" ) ) {
+        if ( command_exists( "systemctl" ) ) {
+            run_shell( "systemctl daemon-reload >/dev/null 2>&1" );
+            if ( !run_shell_capture_stderr(
+                    "systemctl restart systemd-modules-load.service >/dev/null 2>&1" ) ) {
+                fprintf(
+                    stderr,
+                    "Could not restart systemd-modules-load now; autoload will apply on next boot.\n"
+                );
+            }
+        }
+        return 1;
+    }
+
+    if ( enable_openrc_boot_module() ) {
+        return 1;
+    }
+
+    if ( file_exists( "/etc/modules" ) ) {
+        snprintf(
+            cmd,
+            sizeof( cmd ),
+            "grep -qxF \"myass\" /etc/modules || echo \"myass\" >> /etc/modules"
+        );
+        if ( run_shell_capture_stderr( cmd ) ) {
+            fprintf(
+                stderr,
+                "Registered myass in /etc/modules fallback for boot-time loading.\n"
+            );
+            return 1;
+        }
+    }
+
+    fprintf(
+        stderr,
+        "Could not persist boot-time autoload registration for myass. "
+        "Kernel module may not load automatically on next boot.\n"
+    );
+    return 0;
+}
 
 static int
 file_exists( const char *path )
@@ -242,7 +358,7 @@ print_usage( const char *prog )
 
     fprintf(
         stderr,
-        "%s - Linux Not My ASS (for local testing)\n"
+        "%s - Not My ASS - Have you ever wanted to feel like a BSODkid on Linux? (%s)\n"
         "Usage:\n"
         "  %s [options]\n"
         "\n"
@@ -255,7 +371,18 @@ print_usage( const char *prog )
         "                           Requires root and explicit confirmation.\n"
         "\n",
         exe_name,
+        kDkmsModuleVersion,
         exe_name
+    );
+}
+
+static void
+print_banner( void )
+{
+    fprintf(
+        stderr,
+        "Not My ASS - Have you ever wanted to feel like a BSODkid on Linux? (%s)\n",
+        kDkmsModuleVersion
     );
 }
 
@@ -881,6 +1008,12 @@ install_with_dkms( void )
     installed = insmod_module( cmd );
 
 done:
+    if ( installed && !enable_boot_module_autoload() ) {
+        fprintf(
+            stderr,
+            "DKMS install succeeded, but automatic load-on-boot could not be configured.\n"
+        );
+    }
     cleanup_dkms_workspace( dkms_src_root );
     return installed;
 }
@@ -981,6 +1114,12 @@ install_driver_permanently( void )
 
     if ( command_exists( "modprobe" ) ) {
         if ( run_shell_capture_stderr( "modprobe myass" ) ) {
+            if ( !enable_boot_module_autoload() ) {
+                fprintf(
+                    stderr,
+                    "Module is loaded, but automatic load-on-boot could not be configured.\n"
+                );
+            }
             return 1;
         }
         fprintf(
@@ -992,7 +1131,17 @@ install_driver_permanently( void )
     }
 
     snprintf( cmd, sizeof( cmd ), "insmod \"%s\"", dst_module );
-    return run_shell_capture_stderr( cmd );
+    if ( run_shell_capture_stderr( cmd ) ) {
+        if ( !enable_boot_module_autoload() ) {
+            fprintf(
+                stderr,
+                "Module is loaded, but automatic load-on-boot could not be configured.\n"
+            );
+        }
+        return 1;
+    }
+
+    return 0;
 }
 
 #if HAS_X11_GUI
@@ -1174,6 +1323,7 @@ main( int argc, char **argv )
 	int wants_cli = 0;
 	int show_help = 0;
 	int install_driver = 0;
+	print_banner();
 
 	for ( i = 1; i < argc; i++ ) {
 		if ( strcmp( argv[ i ], "/crash" ) == 0 ||
