@@ -197,10 +197,10 @@ INSTALL MYASS
 By default the app now tries DKMS first:
 
 - It expects `myass.c` and `Makefile` to be present next to the binary (or in `../sys/`).
-- It copies those files into `/usr/src/myass-1.0`, runs:
-  - `dkms add -m myass -v 1.0`
-  - `dkms build -m myass -v 1.0 -k <uname -r>`
-  - `dkms install -m myass -v 1.0 -k <uname -r>`
+- It copies those files into `/usr/src/myass-1.0.1`, runs:
+  - `dkms add -m myass -v 1.0.1`
+  - `dkms build -m myass -v 1.0.1 -k <uname -r>`
+  - `dkms install -m myass -v 1.0.1 -k <uname -r>`
 - On success, it loads via `modprobe myass`.
 
 This gives a module build tied to the running kernel, which avoids stale prebuilt
@@ -219,10 +219,10 @@ If install still fails on Alpine, rerun with output visible and check for:
 
 - command availability issues (`modprobe`, `insmod`, `depmod`, `mkdir`, `chmod`)
 - permission errors while writing to `/lib/modules/<uname -r>/extra`
-- explicit confirmation prompt not completed (`INSTALL MYASS`)
-- DKMS build/install failures (if using dkms mode):
+  - explicit confirmation prompt not completed (`INSTALL MYASS`)
+  - DKMS build/install failures (if using dkms mode):
   - missing build dependencies (`make`, `gcc`, `kernel headers`, `linux-tools`)
-  - stale/incorrect source in `/usr/src/myass-1.0`
+  - stale/incorrect source in `/usr/src/myass-1.0.1`
   - run `dkms status` and inspect `dkms` output for build details
 
 If you still see `Invalid module format`:
