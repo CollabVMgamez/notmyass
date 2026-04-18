@@ -637,6 +637,13 @@ find_bundled_source_file( const char *filename, char *out, size_t out_size )
 
     get_executable_dir( exe_dir, sizeof( exe_dir ) );
 
+    if ( strcmp( filename, "myass.c" ) == 0 ) {
+        snprintf( out, out_size, "%s/../sys/%s", exe_dir, filename );
+        if ( file_exists( out ) ) {
+            return 1;
+        }
+    }
+
     snprintf( out, out_size, "%s/%s", exe_dir, filename );
     if ( file_exists( out ) ) {
         return 1;
