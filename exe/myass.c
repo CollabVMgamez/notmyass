@@ -1207,6 +1207,14 @@ main( int argc, char **argv )
 		return EXIT_FAILURE;
 	}
 
+	if ( install_driver ) {
+		if ( !ensure_driver_loaded( 1 ) ) {
+			fprintf( stderr, "Driver install requested; installation did not complete.\n" );
+			return 1;
+		}
+		return EXIT_SUCCESS;
+	}
+
 	if ( !ensure_driver_loaded( install_driver ) ) {
 		return 1;
 	}
