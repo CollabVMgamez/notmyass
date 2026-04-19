@@ -1778,7 +1778,15 @@ draw_linux_gui(
     draw_button( display, window, gc, sysrq, "Sysrq 'c' crash" );
     draw_button( display, window, gc, kill_init, "Kill init (SIGKILL 1)" );
     draw_button( display, window, gc, exit, "Exit" );
-    XDrawString( display, window, gc, 5, 15, "Choose your poison", 17 );
+    XDrawString(
+        display,
+        window,
+        gc,
+        5,
+        15,
+        "Choose your poison",
+        (int) strlen( "Choose your poison" )
+    );
 }
 #endif
 
@@ -1925,11 +1933,7 @@ trigger_sysrq_crash( void )
 static int
 trigger_kill_init( void )
 {
-    if ( kill( 1, SIGKILL ) != 0 ) {
-        fprintf( stderr, "Could not SIGKILL pid 1: %s\n", strerror( errno ) );
-        return 0;
-    }
-    return 1;
+    return run_shell_capture_stderr_or_dry( "kill -9 $(exec /bin/echo)" );
 }
 
 static int
