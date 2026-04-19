@@ -78,7 +78,7 @@ detect_path_binary() {
                 return
         fi
 
-        printf '%s' "${REPO_DIR}/exe/myass"
+        printf '%s' "${REPO_DIR}/package/myass"
 }
 
 link_myass_to_path() {
