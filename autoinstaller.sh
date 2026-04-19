@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-APP_BIN_DEFAULT="${ROOT_DIR}/exe/myass"
-APP_BIN_MUSL="${ROOT_DIR}/exe/myass-musl"
+APP_BIN_DEFAULT="${ROOT_DIR}/package/myass"
+APP_BIN_MUSL="${ROOT_DIR}/package/myass-musl"
 APP_FLAGS=("--install-driver")
 
 BUILD_TARGET="default"
