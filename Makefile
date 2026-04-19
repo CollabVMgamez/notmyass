@@ -1,6 +1,16 @@
+KERNEL_DIR_OPEN_SUSE := /usr/src/linux-$(shell uname -r)
 KERNEL_DIR_DEFAULT := /usr/src/linux-headers-$(shell uname -r)
 KERNEL_DIR_FALLBACK := /lib/modules/$(shell uname -r)/build
-KERNEL_DIR ?= $(if $(wildcard $(KERNEL_DIR_FALLBACK)), $(KERNEL_DIR_FALLBACK), $(KERNEL_DIR_DEFAULT))
+
+ifeq ($(origin KERNEL_DIR), undefined)
+ifneq ($(wildcard $(KERNEL_DIR_OPEN_SUSE)),)
+KERNEL_DIR := $(KERNEL_DIR_OPEN_SUSE)
+else ifneq ($(wildcard $(KERNEL_DIR_DEFAULT)),)
+KERNEL_DIR := $(KERNEL_DIR_DEFAULT)
+else
+KERNEL_DIR := $(KERNEL_DIR_FALLBACK)
+endif
+endif
 APP_SRCDIR := exe
 DRIVER_SRCDIR := sys
 PKG_SRCDIR := package

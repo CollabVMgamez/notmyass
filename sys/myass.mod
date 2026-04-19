@@ -1,2 +1,2 @@
-/home/user/notmyASS/sys/myass.o
+/home/user/notmyass/sys/myass.o
 

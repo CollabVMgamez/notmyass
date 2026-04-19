@@ -7,6 +7,7 @@
 //
 //======================================================================
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 
 #ifdef _WIN32
@@ -175,6 +176,7 @@ WinMain(
 
 #include <fcntl.h>
 #include <errno.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <string.h>
@@ -204,31 +206,441 @@ WinMain(
 static const char kCrashReasonHex[] = "0x6D79617373";
 static const char *kDriverPath = "/dev/myass";
 static const char *kWindowTitle = "Not My ASS";
+static const char *kSysrqPath = "/proc/sysrq-trigger";
+static const char *kDefaultCrashReason = "0x6D79617373";
 static const char *kModuleName = "myass.ko";
 static const char *kDkmsModuleName = "myass";
-static const char *kDkmsModuleVersion = "1.0.1";
+static const char *kDkmsModuleVersion = "1.1";
 static const char *kDkmsSrcBase = "/usr/src";
 static const char *kDkmsConfName = "dkms.conf";
 static const char *kModulesLoadPath = "/etc/modules-load.d/myass.conf";
 static const char *kOpenrcModulesPath = "/etc/conf.d/modules";
 
-#define GUI_BTN_CRASH_X 25
-#define GUI_BTN_CRASH_Y 30
-#define GUI_BTN_CRASH_W 90
-#define GUI_BTN_CRASH_H 30
-#define GUI_BTN_EXIT_X  25
-#define GUI_BTN_EXIT_Y  70
-#define GUI_BTN_EXIT_W  90
+#define GUI_BTN_DRIVER_X 25
+#define GUI_BTN_DRIVER_Y 35
+#define GUI_BTN_DRIVER_W 170
+#define GUI_BTN_DRIVER_H 30
+#define GUI_BTN_SYSRQ_X  25
+#define GUI_BTN_SYSRQ_Y  75
+#define GUI_BTN_SYSRQ_W  170
+#define GUI_BTN_SYSRQ_H  30
+#define GUI_BTN_KILL_X  25
+#define GUI_BTN_KILL_Y  115
+#define GUI_BTN_KILL_W  170
+#define GUI_BTN_KILL_H  30
+#define GUI_BTN_EXIT_X   25
+#define GUI_BTN_EXIT_Y   165
+#define GUI_BTN_EXIT_W   170
 #define GUI_BTN_EXIT_H  30
+
+#define CRASH_REASON_MAX 127
+
+#define STATUS_PREFIX "MYASS_STATUS"
+#define ACTION_CONFIRM_TEXT "YES"
+
+typedef enum {
+    INSTALL_MODE_ONCE = 0,
+    INSTALL_MODE_BOOT
+} install_mode_t;
+
+typedef enum {
+    POISON_DRIVER = 0,
+    POISON_SYSRQ,
+    POISON_KILL_INIT
+} poison_t;
 
 #define SHELL_CMD_MAX 8192
 #define INSTALL_CONFIRM_TEXT "INSTALL MYASS"
 
+static int g_delay_seconds = 0;
+static int g_dry_run = 0;
+static int g_wants_tty = 1;
+static FILE *g_log_file = NULL;
+static install_mode_t g_install_mode = INSTALL_MODE_BOOT;
+static int g_status_requested = 0;
+static int g_uninstall_requested = 0;
+static int g_version_requested = 0;
+
+static const char *kInstallModeNames[] = { "once", "boot" };
+
 static int command_exists( const char *command );
 static int file_exists( const char *path );
+static int run_shell_or_dry( const char *cmd );
+static int run_shell_capture_stderr_or_dry( const char *cmd );
 static int run_shell( const char *cmd );
 static int run_shell_capture_stderr( const char *cmd );
+static int open_log_file( const char *path );
+static void close_log_file( void );
+static void status_kv( const char *key, const char *value );
+static void status_kv_int( const char *key, int value );
+static void status_print_mode( void );
+static int has_tty( void );
+static int parse_install_mode( const char *value, install_mode_t *out_mode );
+static int confirm_action( const char *action_name );
+static int apply_delay( void );
+static int module_is_loaded( void );
+static int file_contains_word( const char *path, const char *token );
+static int has_boot_autoload_marker( void );
+static int find_candidate_module_paths(
+    const char *kernel_release,
+    char *out,
+    size_t out_size
+);
+static int install_with_dkms( int enable_boot_load );
+static int install_driver_permanently( int enable_boot_load );
+static int uninstall_driver( void );
 static int write_text_file( const char *path, const char *content );
+static int uninstall_boot_registration( void );
+static int unload_loaded_module( void );
+static int trigger_driver_crash_with_reason( const char *reason );
+
+static void
+trim_whitespace( char *text )
+{
+    char *end;
+    char *start;
+
+    if ( !text ) {
+        return;
+    }
+
+    start = text;
+    while ( *start && isspace( ( unsigned char ) *start ) ) {
+        start++;
+    }
+    if ( start != text ) {
+        memmove( text, start, strlen( start ) + 1 );
+    }
+
+    end = text + strlen( text );
+    while ( end > text && isspace( ( unsigned char ) end[ -1 ] ) ) {
+        --end;
+    }
+    *end = '\0';
+}
+
+static void
+read_reason_from_stdin( char *out, size_t out_size )
+{
+    const char *fallback = kDefaultCrashReason;
+
+    if ( !out || out_size == 0 ) {
+        return;
+    }
+
+    out[ 0 ] = '\0';
+    if ( !isatty( STDIN_FILENO ) ) {
+        snprintf( out, out_size, "%s", fallback );
+        return;
+    }
+
+    fprintf( stderr, "Custom crash reason (empty uses %s): ", fallback );
+    fflush( stderr );
+    if ( !fgets( out, ( int ) out_size, stdin ) ) {
+        snprintf( out, out_size, "%s", fallback );
+        return;
+    }
+    trim_whitespace( out );
+    if ( out[ 0 ] == '\0' ) {
+        snprintf( out, out_size, "%s", fallback );
+    }
+}
+
+static int
+has_tty( void )
+{
+    return g_wants_tty && isatty( STDIN_FILENO );
+}
+
+static int
+open_log_file( const char *path )
+{
+    if ( !path || !path[ 0 ] ) {
+        return 0;
+    }
+
+    g_log_file = fopen( path, "a" );
+    if ( !g_log_file ) {
+        fprintf( stderr, "Could not open log path %s: %s\n", path, strerror( errno ) );
+        return 0;
+    }
+
+    return 1;
+}
+
+static void
+close_log_file( void )
+{
+    if ( g_log_file ) {
+        fclose( g_log_file );
+        g_log_file = NULL;
+    }
+}
+
+static void
+status_kv( const char *key, const char *value )
+{
+    if ( !key || !value ) {
+        return;
+    }
+
+    fprintf( stderr, "%s_%s=%s\n", STATUS_PREFIX, key, value );
+    if ( g_log_file ) {
+        fprintf( g_log_file, "%s_%s=%s\n", STATUS_PREFIX, key, value );
+        fflush( g_log_file );
+    }
+}
+
+static void
+status_kv_int( const char *key, int value )
+{
+    char value_str[ 64 ];
+    snprintf( value_str, sizeof( value_str ), "%d", value );
+    status_kv( key, value_str );
+}
+
+static int
+parse_install_mode( const char *value, install_mode_t *out_mode )
+{
+    if ( !value || !out_mode ) {
+        return 0;
+    }
+
+    if ( strcmp( value, kInstallModeNames[ INSTALL_MODE_ONCE ] ) == 0 ) {
+        *out_mode = INSTALL_MODE_ONCE;
+        return 1;
+    }
+
+    if ( strcmp( value, kInstallModeNames[ INSTALL_MODE_BOOT ] ) == 0 ) {
+        *out_mode = INSTALL_MODE_BOOT;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+run_shell_or_dry( const char *cmd )
+{
+    if ( !cmd ) {
+        return 0;
+    }
+
+    if ( g_dry_run ) {
+        fprintf( stderr, "DRY-RUN: %s\n", cmd );
+        if ( g_log_file ) {
+            fprintf( g_log_file, "DRY-RUN: %s\n", cmd );
+            fflush( g_log_file );
+        }
+        return 1;
+    }
+
+    return run_shell( cmd );
+}
+
+static int
+run_shell_capture_stderr_or_dry( const char *cmd )
+{
+    if ( !cmd ) {
+        return 0;
+    }
+
+    if ( g_dry_run ) {
+        fprintf( stderr, "DRY-RUN: %s\n", cmd );
+        if ( g_log_file ) {
+            fprintf( g_log_file, "DRY-RUN: %s\n", cmd );
+            fflush( g_log_file );
+        }
+        return 1;
+    }
+
+    return run_shell_capture_stderr( cmd );
+}
+
+static int
+confirm_action( const char *action_name )
+{
+    char response[ 32 ];
+
+    if ( g_dry_run ) {
+        fprintf( stderr, "%s [dry-run] auto-confirmed.\n", action_name );
+        if ( g_log_file ) {
+            fprintf( g_log_file, "%s [dry-run] auto-confirmed.\n", action_name );
+            fflush( g_log_file );
+        }
+        return 1;
+    }
+
+    if ( !has_tty() ) {
+        fprintf(
+            stderr,
+            "%s requires an interactive terminal for confirmation.\n",
+            action_name
+        );
+        return 0;
+    }
+
+    fprintf(
+        stderr,
+        "Type '%s' (all caps, no quotes) to confirm %s: ",
+        ACTION_CONFIRM_TEXT,
+        action_name
+    );
+    fflush( stderr );
+
+    if ( !fgets( response, sizeof( response ), stdin ) ) {
+        return 0;
+    }
+
+    trim_whitespace( response );
+    if ( strcmp( response, ACTION_CONFIRM_TEXT ) != 0 ) {
+        fprintf( stderr, "Permission denied.\n" );
+        return 0;
+    }
+
+    return 1;
+}
+
+static int
+apply_delay( void )
+{
+    if ( g_delay_seconds <= 0 ) {
+        return 1;
+    }
+
+    if ( g_dry_run ) {
+        fprintf( stderr, "Dry-run delay: %d seconds skipped.\n", g_delay_seconds );
+        return 1;
+    }
+
+    sleep( g_delay_seconds );
+    return 1;
+}
+
+static void
+status_print_mode( void )
+{
+    status_kv( "VERSION", kDkmsModuleVersion );
+    status_kv( "INSTALL_MODE", g_install_mode == INSTALL_MODE_BOOT ? "boot" : "once" );
+    status_kv_int( "DELAY_SECONDS", g_delay_seconds );
+    status_kv_int( "DRY_RUN", g_dry_run );
+    status_kv( "DRIVER_LOADED", module_is_loaded() ? "yes" : "no" );
+    status_kv( "BOOT_AUTOLOAD", has_boot_autoload_marker() ? "yes" : "no" );
+}
+
+static int
+module_is_loaded( void )
+{
+    return file_contains_word( "/proc/modules", kDkmsModuleName );
+}
+
+static int
+file_contains_word( const char *path, const char *token )
+{
+    FILE *fp;
+    char line[ 4096 ];
+    size_t token_len;
+    const char *hit;
+    int found = 0;
+
+    if ( !path || !token || !token[ 0 ] ) {
+        return 0;
+    }
+
+    token_len = strlen( token );
+    fp = fopen( path, "r" );
+    if ( !fp ) {
+        return 0;
+    }
+
+    while ( fgets( line, ( int ) sizeof( line ), fp ) ) {
+        char *cursor = line;
+
+        while ( ( hit = strstr( cursor, token ) ) != NULL ) {
+            int before_ok = ( hit == line ) ||
+                isspace( ( unsigned char ) hit[ -1 ] ) ||
+                hit[ -1 ] == '\n' ||
+                hit[ -1 ] == '"';
+            int after_pos = ( int ) ( hit - line + token_len );
+            int after_ok = ( ( size_t ) after_pos >= strlen( line ) ) ||
+                isspace( ( unsigned char ) line[ after_pos ] ) ||
+                line[ after_pos ] == '\n' ||
+                line[ after_pos ] == '"';
+
+            if ( before_ok && after_ok ) {
+                found = 1;
+                break;
+            }
+            cursor = ( char * ) hit + 1;
+        }
+
+        if ( found ) {
+            break;
+        }
+    }
+
+    if ( fclose( fp ) != 0 ) {
+        return found;
+    }
+
+    return found;
+}
+
+static int
+has_boot_autoload_marker( void )
+{
+    if ( file_exists( kModulesLoadPath ) && file_contains_word( kModulesLoadPath, "myass" ) ) {
+        return 1;
+    }
+
+    if ( file_exists( kOpenrcModulesPath ) && file_contains_word( kOpenrcModulesPath, "myass" ) ) {
+        return 1;
+    }
+
+    if ( file_exists( "/etc/modules" ) && file_contains_word( "/etc/modules", "myass" ) ) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+find_candidate_module_paths(
+    const char *kernel_release,
+    char *out,
+    size_t out_size
+)
+{
+    const char *patterns[] = {
+        "/lib/modules/%s/updates/dkms/%s",
+        "/lib/modules/%s/extra/%s",
+        "/lib/modules/%s/kernel/drivers/myass/%s",
+        "/lib/modules/%s/kernel/drivers/misc/myass/%s",
+        NULL
+    };
+    char path[ PATH_MAX ];
+    size_t i;
+
+    if ( !kernel_release || !out || out_size == 0 ) {
+        return 0;
+    }
+
+    for ( i = 0; patterns[ i ]; i++ ) {
+        snprintf(
+            path,
+            sizeof( path ),
+            patterns[ i ],
+            kernel_release,
+            kModuleName
+        );
+        if ( file_exists( path ) ) {
+            snprintf( out, out_size, "%s", path );
+            return 1;
+        }
+    }
+
+    return 0;
+}
 
 static int
 enable_openrc_boot_module( void )
@@ -367,12 +779,23 @@ print_usage( const char *prog )
         "  %s [options]\n"
         "\n"
         "Options:\n"
-        "  -h, --help, /?          Show this help text and exit.\n"
-        "  -crash, --crash          Trigger crash request immediately.\n"
+        "  -h, --help, /?              Show this help text and exit.\n"
+        "  -crash, --crash, -driver,\n"
+        "  /driver, --driver            Trigger driver crash immediately.\n"
+        "                               You can add a custom reason using:\n"
+        "                               --reason <text>\n"
+        "  -sysrq, --sysrq              Trigger kernel crash via SysRq 'c'.\n"
+        "  -kill-init, --kill-init      Trigger SIGKILL 1.\n"
+        "  --delay <seconds>            Delay before executing the selected action.\n"
+        "  --dry-run                    Print commands without executing mutations.\n"
+        "  --log <path>                 Mirror status output to a log file.\n"
         "  -install-driver,\n"
         "  /install-driver,\n"
-        "  --install-driver         Persistently install module and then load it.\n"
-        "                           Requires root and explicit confirmation.\n"
+        "  --install-driver[=mode]      Persistently install module. Optional mode:\n"
+        "                               --install-driver once|boot (default boot).\n"
+        "  --uninstall-driver            Remove installed module and startup wiring.\n"
+        "  --status                     Print machine-readable MYASS_STATUS_* lines.\n"
+        "  --version                    Print version and exit.\n"
         "\n",
         exe_name,
         kDkmsModuleVersion,
@@ -594,6 +1017,14 @@ static int
 prompt_for_explicit_permission( void )
 {
     char response[ 32 ];
+
+    if ( g_dry_run ) {
+        fprintf(
+            stderr,
+            "INSTALL MYASS [dry-run] auto-confirmed.\n"
+        );
+        return 1;
+    }
 
     if ( !isatty( STDIN_FILENO ) ) {
         fprintf(
@@ -845,7 +1276,7 @@ cleanup_dkms_workspace( const char *path )
 }
 
 static int
-install_with_dkms( void )
+install_with_dkms( int enable_boot_load )
 {
     struct utsname uts;
     char cmd[ SHELL_CMD_MAX ];
@@ -899,13 +1330,13 @@ install_with_dkms( void )
         "rm -rf \"%s\"",
         dkms_src_root
     );
-    if ( !run_shell( cmd ) ) {
+    if ( !run_shell_or_dry( cmd ) ) {
         fprintf( stderr, "Could not clear previous DKMS source directory %s.\n", dkms_src_root );
         return 0;
     }
 
     snprintf( cmd, sizeof( cmd ), "mkdir -p \"%s\"", dkms_src_root );
-    if ( !run_shell( cmd ) ) {
+    if ( !run_shell_or_dry( cmd ) ) {
         fprintf( stderr, "Could not create DKMS source directory %s.\n", dkms_src_root );
         return 0;
     }
@@ -942,7 +1373,7 @@ install_with_dkms( void )
         kDkmsModuleName,
         kDkmsModuleVersion
     );
-    run_shell( cmd );
+    run_shell_or_dry( cmd );
 
     fprintf(
         stderr,
@@ -957,7 +1388,7 @@ install_with_dkms( void )
         kDkmsModuleName,
         kDkmsModuleVersion
     );
-    if ( !run_shell_capture_stderr( cmd ) ) {
+    if ( !run_shell_capture_stderr_or_dry( cmd ) ) {
         cleanup_dkms_workspace( dkms_src_root );
         return 0;
     }
@@ -970,7 +1401,7 @@ install_with_dkms( void )
         kDkmsModuleVersion,
         uts.release
     );
-    if ( !run_shell_capture_stderr( cmd ) ) {
+    if ( !run_shell_capture_stderr_or_dry( cmd ) ) {
         fprintf(
             stderr,
             "DKMS build failed. Verify kernel headers/tools and rerun with verbose output.\n"
@@ -987,13 +1418,13 @@ install_with_dkms( void )
         kDkmsModuleVersion,
         uts.release
     );
-    if ( !run_shell_capture_stderr( cmd ) ) {
+    if ( !run_shell_capture_stderr_or_dry( cmd ) ) {
         cleanup_dkms_workspace( dkms_src_root );
         return 0;
     }
 
     if ( command_exists( "modprobe" ) ) {
-        if ( run_shell_capture_stderr( "modprobe myass" ) ) {
+        if ( run_shell_capture_stderr_or_dry( "modprobe myass" ) ) {
             installed = 1;
             goto done;
         }
@@ -1012,18 +1443,20 @@ install_with_dkms( void )
     installed = insmod_module( cmd );
 
 done:
-    if ( installed && !enable_boot_module_autoload() ) {
-        fprintf(
-            stderr,
-            "DKMS install succeeded, but automatic load-on-boot could not be configured.\n"
-        );
+    if ( installed && enable_boot_load ) {
+        if ( !enable_boot_module_autoload() ) {
+            fprintf(
+                stderr,
+                "DKMS install succeeded, but automatic load-on-boot could not be configured.\n"
+            );
+        }
     }
     cleanup_dkms_workspace( dkms_src_root );
     return installed;
 }
 
 static int
-install_driver_permanently( void )
+install_driver_permanently( int enable_boot_load )
 {
     struct utsname uts;
     char kernel_release[ PATH_MAX ];
@@ -1048,7 +1481,7 @@ install_driver_permanently( void )
 
     if ( command_exists( "dkms" ) ) {
         fprintf( stderr, "Attempting DKMS-based install for persistent myass driver.\n" );
-        if ( install_with_dkms() ) {
+        if ( install_with_dkms( enable_boot_load ) ) {
             return 1;
         }
         fprintf(
@@ -1080,7 +1513,7 @@ install_driver_permanently( void )
         return 0;
     }
     snprintf( cmd, sizeof( cmd ), "mkdir -p \"%s\" >/dev/null 2>&1", dst_dir );
-    if ( !run_shell( cmd ) ) {
+    if ( !run_shell_or_dry( cmd ) ) {
         return 0;
     }
 
@@ -1096,11 +1529,11 @@ install_driver_permanently( void )
 
     snprintf( cmd, sizeof( cmd ), "depmod -a %s", kernel_release );
     if ( command_exists( "depmod" ) ) {
-        if ( !run_shell( cmd ) ) {
-            fprintf(
-                stderr,
-                "depmod failed; continuing anyway to direct module load.\n"
-            );
+    if ( !run_shell_or_dry( cmd ) ) {
+        fprintf(
+            stderr,
+            "depmod failed; continuing anyway to direct module load.\n"
+        );
         }
     } else {
         fprintf( stderr, "depmod not found; skipping dependency regeneration.\n" );
@@ -1113,12 +1546,12 @@ install_driver_permanently( void )
         dst_module
     );
     if ( command_exists( "chmod" ) ) {
-        run_shell( cmd );
+        run_shell_or_dry( cmd );
     }
 
     if ( command_exists( "modprobe" ) ) {
-        if ( run_shell_capture_stderr( "modprobe myass" ) ) {
-            if ( !enable_boot_module_autoload() ) {
+        if ( run_shell_capture_stderr_or_dry( "modprobe myass" ) ) {
+            if ( enable_boot_load && !enable_boot_module_autoload() ) {
                 fprintf(
                     stderr,
                     "Module is loaded, but automatic load-on-boot could not be configured.\n"
@@ -1135,8 +1568,8 @@ install_driver_permanently( void )
     }
 
     snprintf( cmd, sizeof( cmd ), "insmod \"%s\"", dst_module );
-    if ( run_shell_capture_stderr( cmd ) ) {
-        if ( !enable_boot_module_autoload() ) {
+    if ( run_shell_capture_stderr_or_dry( cmd ) ) {
+        if ( enable_boot_load && !enable_boot_module_autoload() ) {
             fprintf(
                 stderr,
                 "Module is loaded, but automatic load-on-boot could not be configured.\n"
@@ -1146,6 +1579,138 @@ install_driver_permanently( void )
     }
 
     return 0;
+}
+
+static int
+uninstall_boot_registration( void )
+{
+    char cmd[ SHELL_CMD_MAX ];
+    int changed = 0;
+
+    if ( file_exists( kModulesLoadPath ) ) {
+        snprintf(
+            cmd,
+            sizeof( cmd ),
+            "rm -f \"%s\"",
+            kModulesLoadPath
+        );
+        run_shell_or_dry( cmd );
+        changed = 1;
+    }
+
+    if ( file_exists( kOpenrcModulesPath ) ) {
+        snprintf(
+            cmd,
+            sizeof( cmd ),
+            "sed -i -E 's/(^|[[:space:]])myass([[:space:]]|$)/ /g; s/[[:space:]]{2,}/ /g; s/^([[:space:]]*modules[[:space:]]*=[[:space:]]*\"[[:space:]]*)[[:space:]]*\"$/\\1\"/g' \"%s\"",
+            kOpenrcModulesPath
+        );
+        run_shell_or_dry( cmd );
+        changed = 1;
+    }
+
+    if ( file_exists( "/etc/modules" ) ) {
+        snprintf(
+            cmd,
+            sizeof( cmd ),
+            "grep -v '^myass$' < /etc/modules > /tmp/myass-modules.$$ && mv /tmp/myass-modules.$$ /etc/modules"
+        );
+        run_shell_or_dry( cmd );
+        changed = 1;
+    }
+
+    return changed;
+}
+
+static int
+unload_loaded_module( void )
+{
+    if ( !module_is_loaded() ) {
+        return 1;
+    }
+
+    if ( command_exists( "modprobe" ) ) {
+        if ( run_shell_capture_stderr_or_dry( "modprobe -r myass" ) ) {
+            return 1;
+        }
+        fprintf( stderr, "modprobe -r failed, attempting rmmod...\n" );
+    }
+
+    return run_shell_capture_stderr_or_dry( "rmmod myass" );
+}
+
+static int
+uninstall_driver( void )
+{
+    struct utsname uts;
+    char installed_module[ PATH_MAX ];
+    int had_any = 0;
+
+    if ( geteuid() != 0 ) {
+        fprintf( stderr, "Persistent uninstall requires root privileges.\n" );
+        return 0;
+    }
+
+    if ( !confirm_action( "uninstalling myass module" ) ) {
+        return 0;
+    }
+
+    if ( uname( &uts ) != 0 ) {
+        fprintf( stderr, "Could not read kernel release.\n" );
+        return 0;
+    }
+
+    if ( find_candidate_module_paths( uts.release, installed_module, sizeof( installed_module ) ) ) {
+        had_any = 1;
+        if ( !run_shell_capture_stderr_or_dry( "sync" ) ) {
+            /* ignore */
+        }
+        snprintf(
+            installed_module,
+            sizeof( installed_module ),
+            "rm -f \"%s\"",
+            installed_module
+        );
+        run_shell_or_dry( installed_module );
+        if ( command_exists( "depmod" ) ) {
+            char depmod_cmd[ SHELL_CMD_MAX ];
+            snprintf(
+                depmod_cmd,
+                sizeof( depmod_cmd ),
+                "depmod -a %s",
+                uts.release
+            );
+            run_shell_or_dry( depmod_cmd );
+        }
+    }
+
+    if ( command_exists( "dkms" ) ) {
+        char dkms_cmd[ SHELL_CMD_MAX ];
+        snprintf(
+            dkms_cmd,
+            sizeof( dkms_cmd ),
+            "dkms remove -m %s -v %s --all",
+            kDkmsModuleName,
+            kDkmsModuleVersion
+        );
+        if ( run_shell_capture_stderr_or_dry( dkms_cmd ) ) {
+            had_any = 1;
+        }
+    }
+
+    if ( unload_loaded_module() ) {
+        had_any = 1;
+    }
+
+    if ( uninstall_boot_registration() ) {
+        had_any = 1;
+    }
+
+    if ( !had_any ) {
+        fprintf( stderr, "No myass module installation artifacts were found.\n" );
+    }
+
+    return had_any;
 }
 
 #if HAS_X11_GUI
@@ -1189,11 +1754,19 @@ draw_linux_gui(
     Display *display,
     Window window,
     GC gc
-    )
+)
 {
-    rect_t crash = {
-        GUI_BTN_CRASH_X, GUI_BTN_CRASH_Y,
-        GUI_BTN_CRASH_W, GUI_BTN_CRASH_H
+    rect_t driver = {
+        GUI_BTN_DRIVER_X, GUI_BTN_DRIVER_Y,
+        GUI_BTN_DRIVER_W, GUI_BTN_DRIVER_H
+    };
+    rect_t sysrq = {
+        GUI_BTN_SYSRQ_X, GUI_BTN_SYSRQ_Y,
+        GUI_BTN_SYSRQ_W, GUI_BTN_SYSRQ_H
+    };
+    rect_t kill_init = {
+        GUI_BTN_KILL_X, GUI_BTN_KILL_Y,
+        GUI_BTN_KILL_W, GUI_BTN_KILL_H
     };
     rect_t exit = {
         GUI_BTN_EXIT_X, GUI_BTN_EXIT_Y,
@@ -1201,17 +1774,13 @@ draw_linux_gui(
     };
 
     XClearWindow( display, window );
-    draw_button( display, window, gc, crash, "Crash" );
+    draw_button( display, window, gc, driver, "Driver crash" );
+    draw_button( display, window, gc, sysrq, "Sysrq 'c' crash" );
+    draw_button( display, window, gc, kill_init, "Kill init (SIGKILL 1)" );
     draw_button( display, window, gc, exit, "Exit" );
-    XDrawString( display, window, gc, 5, 15, "NotMyASS", 8 );
+    XDrawString( display, window, gc, 5, 15, "Choose your poison", 17 );
 }
 #endif
-
-/* Must match MYASS_IOCTL_CRASH in sys/myass.c */
-#ifndef _IOC_TYPECHECK
-#define _IOC_TYPECHECK(t) (sizeof(t))
-#endif
-#define MYASS_IOCTL_CRASH _IO('M', 0x06)
 
 static int
 load_bundled_modules( void )
@@ -1245,7 +1814,7 @@ ensure_driver_loaded( int install_if_missing )
 {
     if ( install_if_missing ) {
         fprintf( stderr, "Attempting explicit persistent install...\n" );
-        if ( install_driver_permanently() ) {
+        if ( install_driver_permanently( g_install_mode == INSTALL_MODE_BOOT ) ) {
             return access( kDriverPath, F_OK ) == 0;
         }
         fprintf(
@@ -1261,7 +1830,7 @@ ensure_driver_loaded( int install_if_missing )
     fprintf( stderr, "Driver not loaded yet. Attempting to load myass module...\n" );
 
     if ( command_exists( "modprobe" ) ) {
-        if ( run_shell_capture_stderr( "modprobe myass" ) ) {
+        if ( run_shell_capture_stderr_or_dry( "modprobe myass" ) ) {
             return access( kDriverPath, F_OK ) == 0;
         }
         fprintf(
@@ -1276,22 +1845,13 @@ ensure_driver_loaded( int install_if_missing )
 
     {
         struct utsname uts;
-        char path[ SHELL_CMD_MAX ];
+        char path[ PATH_MAX ];
 
         if ( uname( &uts ) == 0 ) {
-            snprintf(
-                path,
-                sizeof( path ),
-                "/lib/modules/%s/kernel/drivers/myass/myass.ko",
-                uts.release
-            );
-            if ( insmod_module( path ) ) {
-                return access( kDriverPath, F_OK ) == 0;
-            }
-
-            snprintf( path, sizeof( path ), "/lib/modules/%s/extra/myass.ko", uts.release );
-            if ( insmod_module( path ) ) {
-                return access( kDriverPath, F_OK ) == 0;
+            if ( find_candidate_module_paths( uts.release, path, sizeof( path ) ) ) {
+                if ( insmod_module( path ) ) {
+                    return access( kDriverPath, F_OK ) == 0;
+                }
             }
         }
     }
@@ -1304,20 +1864,122 @@ ensure_driver_loaded( int install_if_missing )
     return 0;
 }
 
-static void
-trigger_crash( void )
+static int
+trigger_driver_crash_with_reason( const char *reason )
 {
     int fd;
+    const char *payload = reason && reason[ 0 ] ? reason : kDefaultCrashReason;
+    size_t payload_len;
 
-    fprintf( stderr, "Crash requested. reason: %s\n", kCrashReasonHex );
+    payload_len = strlen( payload );
+    fprintf( stderr, "Driver crash requested. reason: %s\n", payload );
 
     fd = open( kDriverPath, O_WRONLY );
     if ( fd >= 0 ) {
-        ioctl( fd, MYASS_IOCTL_CRASH, NULL );
+        if ( write( fd, payload, payload_len ) != ( ssize_t ) payload_len ) {
+            fprintf( stderr, "Failed to send custom reason to driver: %s\n", strerror( errno ) );
+            close( fd );
+            raise( SIGSEGV );
+            return 0;
+        }
         close( fd );
+        return 1;
     }
 
+    fprintf(
+        stderr,
+        "Could not open driver %s: %s\n",
+        kDriverPath,
+        strerror( errno )
+    );
     raise( SIGSEGV );
+    return 0;
+}
+
+static int
+trigger_sysrq_crash( void )
+{
+    int fd;
+
+    fd = open( kSysrqPath, O_WRONLY );
+    if ( fd < 0 ) {
+        fprintf(
+            stderr,
+            "Could not open %s: %s\n",
+            kSysrqPath,
+            strerror( errno )
+        );
+        return 0;
+    }
+
+    if ( write( fd, "c", 1 ) != 1 ) {
+        fprintf( stderr, "Failed to trigger SysRq c: %s\n", strerror( errno ) );
+        close( fd );
+        return 0;
+    }
+
+    close( fd );
+    return 1;
+}
+
+static int
+trigger_kill_init( void )
+{
+    if ( kill( 1, SIGKILL ) != 0 ) {
+        fprintf( stderr, "Could not SIGKILL pid 1: %s\n", strerror( errno ) );
+        return 0;
+    }
+    return 1;
+}
+
+static int
+execute_poison(
+    poison_t poison,
+    const char *reason,
+    int ensure_driver,
+    int interactive_confirmation,
+    int always_delay
+    )
+{
+    if ( always_delay ) {
+        if ( !apply_delay() ) {
+            return 0;
+        }
+    }
+
+    if ( poison == POISON_DRIVER ) {
+        if ( !ensure_driver_loaded( ensure_driver ) ) {
+            fprintf(
+                stderr,
+                "Driver not available; continuing to crash attempt.\n"
+            );
+            return 0;
+        }
+        if ( interactive_confirmation && !has_tty() ) {
+            fprintf(
+                stderr,
+                "Driver crash was requested non-interactively. Using preselected reason if provided.\n"
+            );
+        }
+        trigger_driver_crash_with_reason( reason );
+        return 1;
+    }
+
+    if ( poison == POISON_SYSRQ ) {
+        if ( interactive_confirmation && !confirm_action( "kernel SysRq crash trigger" ) ) {
+            return 0;
+        }
+        return trigger_sysrq_crash();
+    }
+
+    if ( poison == POISON_KILL_INIT ) {
+        if ( interactive_confirmation && !confirm_action( "kill init (SIGKILL 1)" ) ) {
+            return 0;
+        }
+        return trigger_kill_init();
+    }
+
+    return 0;
 }
 
 int
@@ -1327,24 +1989,192 @@ main( int argc, char **argv )
 	int wants_cli = 0;
 	int show_help = 0;
 	int install_driver = 0;
+	int parsed_delay = 0;
+	int rc = 0;
+	poison_t poison = POISON_DRIVER;
+	const char *log_path = NULL;
+	const char *reason_arg = NULL;
+	char reason[ CRASH_REASON_MAX + 1 ];
+	char *delay_arg;
+	char *eq;
+	install_mode_t parsed_mode;
+	reason[ 0 ] = '\0';
+
 	print_banner();
 
 	for ( i = 1; i < argc; i++ ) {
 		if ( strcmp( argv[ i ], "/crash" ) == 0 ||
 			 strcmp( argv[ i ], "-crash" ) == 0 ||
-			 strcmp( argv[ i ], "--crash" ) == 0 ) {
+			 strcmp( argv[ i ], "--crash" ) == 0 ||
+			 strcmp( argv[ i ], "/driver" ) == 0 ||
+			 strcmp( argv[ i ], "-driver" ) == 0 ||
+			 strcmp( argv[ i ], "--driver" ) == 0 ) {
 			wants_cli = 1;
+			poison = POISON_DRIVER;
 			continue;
 		}
+
+		if ( strcmp( argv[ i ], "/sysrq" ) == 0 ||
+			 strcmp( argv[ i ], "-sysrq" ) == 0 ||
+			 strcmp( argv[ i ], "--sysrq" ) == 0 ) {
+			wants_cli = 1;
+			poison = POISON_SYSRQ;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "/kill-init" ) == 0 ||
+			 strcmp( argv[ i ], "-kill-init" ) == 0 ||
+			 strcmp( argv[ i ], "--kill-init" ) == 0 ) {
+			wants_cli = 1;
+			poison = POISON_KILL_INIT;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--reason" ) == 0 || strcmp( argv[ i ], "-r" ) == 0 ) {
+			if ( i + 1 >= argc ) {
+				fprintf( stderr, "Missing reason value after %s\n", argv[ i ] );
+				return 1;
+			}
+			reason_arg = argv[ ++i ];
+			continue;
+		}
+
+		if ( strncmp( argv[ i ], "--delay=", 8 ) == 0 ) {
+			delay_arg = argv[ i ] + 8;
+			if ( *delay_arg == '\0' ) {
+				fprintf( stderr, "Missing delay seconds for --delay=<seconds>.\n" );
+				return 1;
+			}
+			g_delay_seconds = atoi( delay_arg );
+			parsed_delay = 1;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--delay" ) == 0 ) {
+			if ( i + 1 >= argc ) {
+				fprintf( stderr, "Missing seconds for --delay.\n" );
+				return 1;
+			}
+			g_delay_seconds = atoi( argv[ ++i ] );
+			parsed_delay = 1;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--dry-run" ) == 0 ) {
+			g_dry_run = 1;
+			continue;
+		}
+
+		if ( strncmp( argv[ i ], "--log=", 6 ) == 0 ) {
+			log_path = argv[ i ] + 6;
+			if ( log_path[ 0 ] == '\0' ) {
+				fprintf( stderr, "Missing path for --log=<path>.\n" );
+				return 1;
+			}
+			continue;
+		}
+		if ( strcmp( argv[ i ], "--log" ) == 0 ) {
+			if ( i + 1 >= argc ) {
+				fprintf( stderr, "Missing path for --log.\n" );
+				return 1;
+			}
+			log_path = argv[ ++i ];
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--status" ) == 0 ) {
+			g_status_requested = 1;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--version" ) == 0 ) {
+			g_version_requested = 1;
+			continue;
+		}
+
+		if ( strncmp( argv[ i ], "--install-driver", 16 ) == 0 ) {
+			eq = argv[ i ] + 16;
+			install_driver = 1;
+			if ( eq[ 0 ] == '\0' ) {
+				continue;
+			}
+			if ( eq[ 0 ] == '=' ) {
+				if ( !parse_install_mode( eq + 1, &parsed_mode ) ) {
+					fprintf(
+						stderr,
+						"Invalid mode for --install-driver=%s. Use once or boot.\n",
+						eq + 1
+					);
+					return 1;
+				}
+				g_install_mode = parsed_mode;
+				continue;
+			}
+			if ( i + 1 < argc && parse_install_mode( argv[ i + 1 ], &parsed_mode ) ) {
+				g_install_mode = parsed_mode;
+				i++;
+				continue;
+			}
+			continue;
+		}
+
+		if ( strncmp( argv[ i ], "--install-mode=", 15 ) == 0 ) {
+			if ( !parse_install_mode( argv[ i ] + 15, &parsed_mode ) ) {
+				fprintf(
+					stderr,
+					"Invalid mode for --install-mode=%s. Use once or boot.\n",
+					argv[ i ] + 15
+				);
+				return 1;
+			}
+			g_install_mode = parsed_mode;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--install-mode" ) == 0 ) {
+			if ( i + 1 >= argc ) {
+				fprintf(
+					stderr,
+					"Missing mode for --install-mode (once|boot).\n"
+				);
+				return 1;
+			}
+			if ( !parse_install_mode( argv[ i + 1 ], &parsed_mode ) ) {
+				fprintf(
+					stderr,
+					"Invalid mode for --install-mode. Use once or boot.\n"
+				);
+				return 1;
+			}
+			g_install_mode = parsed_mode;
+			i++;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--uninstall-driver" ) == 0 ) {
+			g_uninstall_requested = 1;
+			continue;
+		}
+
 		if ( strcmp( argv[ i ], "-h" ) == 0 ||
 			 strcmp( argv[ i ], "--help" ) == 0 ||
 			 strcmp( argv[ i ], "/?" ) == 0 ) {
 			show_help = 1;
+			continue;
 		}
-		if ( strcmp( argv[ i ], "/install-driver" ) == 0 ||
-			 strcmp( argv[ i ], "-install-driver" ) == 0 ||
-			 strcmp( argv[ i ], "--install-driver" ) == 0 ) {
+
+		if (
+			strcmp( argv[ i ], "/install-driver" ) == 0 ||
+			strcmp( argv[ i ], "-install-driver" ) == 0
+		) {
 			install_driver = 1;
+			continue;
+		}
+
+		if ( argv[ i ][ 0 ] == '-' ) {
+			fprintf( stderr, "Unrecognized option: %s\n", argv[ i ] );
+			fprintf( stderr, "Run --help for usage.\n" );
+			return 1;
 		}
 	}
 
@@ -1353,39 +2183,92 @@ main( int argc, char **argv )
 		return 0;
 	}
 
-	if ( wants_cli ) {
-		if ( !ensure_driver_loaded( install_driver ) ) {
-			fprintf( stderr, "Driver not available; continuing to crash attempt.\n" );
+	if ( parsed_delay && g_delay_seconds < 0 ) {
+		fprintf( stderr, "Delay must be a non-negative integer.\n" );
+		return 1;
+	}
+
+	if ( log_path && !open_log_file( log_path ) ) {
+		return 1;
+	}
+
+	if ( g_version_requested ) {
+		status_kv( "VERSION", kDkmsModuleVersion );
+		status_kv( "MODULE_NAME", kDkmsModuleName );
+		close_log_file();
+		return 0;
+	}
+
+	if ( g_status_requested ) {
+		status_print_mode();
+		close_log_file();
+		return 0;
+	}
+
+	if ( g_uninstall_requested ) {
+		if ( install_driver ) {
+			fprintf(
+				stderr,
+				"Conflicting request: both --install-driver and --uninstall-driver were provided.\n"
+			);
+			close_log_file();
+			return 1;
 		}
-		trigger_crash();
-		return EXIT_FAILURE;
+		rc = uninstall_driver();
+		close_log_file();
+		return rc ? 0 : 1;
+	}
+
+	if ( wants_cli ) {
+		if ( reason_arg && reason_arg[ 0 ] ) {
+			snprintf( reason, sizeof( reason ), "%s", reason_arg );
+		}
+		if ( !execute_poison(
+			poison,
+			reason,
+			install_driver,
+			1,
+			1
+		) ) {
+			close_log_file();
+			return 1;
+		}
+		close_log_file();
+		return 0;
 	}
 
 	if ( install_driver ) {
 		if ( !ensure_driver_loaded( 1 ) ) {
 			fprintf( stderr, "Driver install requested; installation did not complete.\n" );
+			close_log_file();
 			return 1;
 		}
-		return EXIT_SUCCESS;
+		close_log_file();
+		return 0;
 	}
 
-	if ( !ensure_driver_loaded( install_driver ) ) {
-		return 1;
-	}
 	fprintf( stderr, "Launching %s GUI...\n", kWindowTitle );
 
 	{
 #if HAS_X11_GUI
-			Display *display;
+		Display *display;
 			int screen;
 			Window window;
 		XEvent event;
 		GC gc;
 		Atom delete_atom;
 		int should_run = 1;
-		rect_t crash_btn = {
-			GUI_BTN_CRASH_X, GUI_BTN_CRASH_Y,
-			GUI_BTN_CRASH_W, GUI_BTN_CRASH_H
+		rect_t driver_btn = {
+			GUI_BTN_DRIVER_X, GUI_BTN_DRIVER_Y,
+			GUI_BTN_DRIVER_W, GUI_BTN_DRIVER_H
+		};
+		rect_t sysrq_btn = {
+			GUI_BTN_SYSRQ_X, GUI_BTN_SYSRQ_Y,
+			GUI_BTN_SYSRQ_W, GUI_BTN_SYSRQ_H
+		};
+		rect_t kill_btn = {
+			GUI_BTN_KILL_X, GUI_BTN_KILL_Y,
+			GUI_BTN_KILL_W, GUI_BTN_KILL_H
 		};
 		rect_t exit_btn = {
 			GUI_BTN_EXIT_X, GUI_BTN_EXIT_Y,
@@ -1399,17 +2282,17 @@ main( int argc, char **argv )
 		}
 
 		screen = DefaultScreen( display );
-		window = XCreateSimpleWindow(
-			display,
-			RootWindow( display, screen ),
-			20,
-			20,
-			200,
-			130,
-			1,
-			BlackPixel( display, screen ),
-			WhitePixel( display, screen )
-		);
+			window = XCreateSimpleWindow(
+				display,
+				RootWindow( display, screen ),
+				20,
+				20,
+				220,
+				220,
+				1,
+				BlackPixel( display, screen ),
+				WhitePixel( display, screen )
+			);
 
 		XStoreName( display, window, kWindowTitle );
 		XSelectInput(
@@ -1425,23 +2308,57 @@ main( int argc, char **argv )
 		XMapRaised( display, window );
 
 		while ( should_run ) {
-			XNextEvent( display, &event );
-			if ( event.type == Expose ) {
-				draw_linux_gui( display, window, gc );
-			} else if ( event.type == ButtonPress ) {
-				if ( point_in_rect(
-						event.xbutton.x,
-						event.xbutton.y,
-						crash_btn ) ) {
-					trigger_crash();
-					continue;
-				}
-				if ( point_in_rect(
-						event.xbutton.x,
-						event.xbutton.y,
-						exit_btn ) ) {
-					should_run = 0;
-				}
+				XNextEvent( display, &event );
+				if ( event.type == Expose ) {
+					draw_linux_gui( display, window, gc );
+				} else if ( event.type == ButtonPress ) {
+					if ( point_in_rect(
+							event.xbutton.x,
+							event.xbutton.y,
+							driver_btn ) ) {
+						char local_reason[ CRASH_REASON_MAX + 1 ];
+						read_reason_from_stdin( local_reason, sizeof( local_reason ) );
+						execute_poison(
+							POISON_DRIVER,
+							local_reason,
+							install_driver,
+							0,
+							1
+						);
+						continue;
+					}
+					if ( point_in_rect(
+							event.xbutton.x,
+							event.xbutton.y,
+							sysrq_btn ) ) {
+						execute_poison(
+							POISON_SYSRQ,
+							NULL,
+							0,
+							0,
+							1
+						);
+						continue;
+					}
+					if ( point_in_rect(
+							event.xbutton.x,
+							event.xbutton.y,
+							kill_btn ) ) {
+						execute_poison(
+							POISON_KILL_INIT,
+							NULL,
+							0,
+							0,
+							1
+						);
+						continue;
+					}
+					if ( point_in_rect(
+							event.xbutton.x,
+							event.xbutton.y,
+							exit_btn ) ) {
+						should_run = 0;
+					}
 			} else if ( event.type == ClientMessage &&
 						( Atom ) event.xclient.data.l[ 0 ] == delete_atom ) {
 				should_run = 0;
@@ -1460,6 +2377,7 @@ main( int argc, char **argv )
 		return 1;
 #endif
 	}
+	close_log_file();
 	return 0;
 }
 

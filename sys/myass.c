@@ -22,9 +22,9 @@
 static const char kCrashReasonHex[] = "0x6D79617373";
 
 static void
-MyassCrash(void)
+MyassCrash( const char *reason )
 {
-    panic("myass: crash reason %s", kCrashReasonHex);
+    panic( "myass: crash reason %s", reason ? reason : kCrashReasonHex );
 }
 
 static long
@@ -34,9 +34,9 @@ MyassIoctl(
     unsigned long arg
     )
 {
-    if (cmd == MYASS_IOCTL_CRASH || (cmd & 0xFF00) == 0x0000) {
-
-        MyassCrash();
+    if ( cmd == MYASS_IOCTL_CRASH ) {
+        MyassCrash( kCrashReasonHex );
+        return 0;
     }
 
     return -EINVAL;
@@ -50,25 +50,23 @@ MyassWrite(
     loff_t *ppos
     )
 {
-    char buf[16];
+    char buf[ 256 ];
+    size_t limit;
 
     if (!user_buf || len == 0) {
         return -EINVAL;
     }
 
-    if (len > sizeof(buf)) {
-        len = sizeof(buf);
-    }
+    limit = len < ( sizeof( buf ) - 1 ) ? len : ( sizeof( buf ) - 1 );
 
-    if (copy_from_user(buf, user_buf, len)) {
+    if (copy_from_user( buf, user_buf, limit )) {
         return -EFAULT;
     }
+    buf[ limit ] = '\0';
 
-    if (len >= sizeof("crash") - 1 && !strncmp(buf, "crash", sizeof("crash") - 1)) {
-        MyassCrash();
-    }
+    MyassCrash( buf );
 
-    return -EINVAL;
+    return ( ssize_t ) limit;
 }
 
 static const struct file_operations myass_fops = {

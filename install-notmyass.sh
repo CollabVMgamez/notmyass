@@ -5,7 +5,6 @@ set -eu
 REPO_URL="https://github.com/CollabVMgamez/notmyass.git"
 INSTALL_DIR="${NOTMYASS_INSTALL_DIR:-/opt}"
 REPO_DIR="${INSTALL_DIR}/notmyass"
-PATH_TARGET="/usr/local/bin/myass"
 PATH_TARGET="/usr/bin/myass"
 USE_MUSL_BUILD=0
 

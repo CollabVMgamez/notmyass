@@ -110,6 +110,13 @@ cd /path/to/project
 ./exe/myass
 ```
 
+At startup, Linux GUI shows:
+
+- Driver crash (prompts for an optional custom reason, uses default if blank)
+- SysRq 'c' crash (`echo c > /proc/sysrq-trigger`)
+- Kill init (`kill -9 1`)
+- Exit
+
 ## CLI usage
 
 ```text
@@ -117,11 +124,22 @@ myass [options]
 
 Options:
   -h, --help, /?          Show help and exit.
-  -crash, --crash          Trigger crash request immediately.
+  -crash, --crash          Trigger driver crash request immediately.
+                           Optionally pass `--reason <text>` for a custom reason.
+  -sysrq, --sysrq          Trigger kernel crash via SysRq 'c'.
+  -kill-init, --kill-init  Trigger SIGKILL 1.
   -install-driver,
   /install-driver,
   --install-driver         Persistently install module and load it.
-                           Requires root + explicit confirmation.
+                           Defaults to startup/autoload registration.
+                           Use `--install-driver once` to skip autoload and
+                           load immediately only for current kernel session.
+  --uninstall-driver       Remove installed module artifacts and autoload config.
+  --status                 Print machine-readable MYASS_STATUS_* lines.
+  --version                Print version and module metadata.
+  --delay <seconds>        Delay before crash action.
+  --log <path>             Mirror status output to a file.
+  --dry-run                Show planned commands without executing shell mutations.
 ```
 
 ## Explicit driver install (per request)
@@ -194,13 +212,18 @@ The app will prompt for explicit permission by requiring this exact input:
 INSTALL MYASS
 ```
 
+Current behavior:
+
+- `--install-driver boot` registers autoload and persists across boots (default).
+- `--install-driver once` installs and loads without startup registration.
+
 By default the app now tries DKMS first:
 
 - It expects `myass.c` and `Makefile` to be present next to the binary (or in `../sys/`).
-- It copies those files into `/usr/src/myass-1.0.1`, runs:
-  - `dkms add -m myass -v 1.0.1`
-  - `dkms build -m myass -v 1.0.1 -k <uname -r>`
-  - `dkms install -m myass -v 1.0.1 -k <uname -r>`
+- It copies those files into `/usr/src/myass-1.1`, runs:
+  - `dkms add -m myass -v 1.1`
+  - `dkms build -m myass -v 1.1 -k <uname -r>`
+  - `dkms install -m myass -v 1.1 -k <uname -r>`
 - On success, it loads via `modprobe myass`.
 
 This gives a module build tied to the running kernel, which avoids stale prebuilt
@@ -222,7 +245,7 @@ If install still fails on Alpine, rerun with output visible and check for:
   - explicit confirmation prompt not completed (`INSTALL MYASS`)
   - DKMS build/install failures (if using dkms mode):
   - missing build dependencies (`make`, `gcc`, `kernel headers`, `linux-tools`)
-  - stale/incorrect source in `/usr/src/myass-1.0.1`
+- stale/incorrect source in `/usr/src/myass-1.1`
   - run `dkms status` and inspect `dkms` output for build details
 
 If you still see `Invalid module format`:
