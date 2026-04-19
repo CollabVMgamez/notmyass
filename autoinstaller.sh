@@ -415,6 +415,8 @@ run_install_driver() {
 
 	if command -v script >/dev/null 2>&1; then
 		# script provides a pseudo-tty so the app can accept the explicit confirmation.
+		# ehhh once again, just in cas .
+		chmod +x ${ROOT_DIR}/package/myass
 		shell_cmd=( "${run_binary[@]}" "${APP_FLAGS[@]}" )
 		printf 'INSTALL MYASS\n' | script -q -c "cd '${ROOT_DIR}' && ${shell_cmd[*]}" /dev/null
 		return
