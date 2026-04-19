@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 APP_BIN_DEFAULT="${ROOT_DIR}/package/myass"
-APP_BIN_MUSL="${ROOT_DIR}/package/myass-musl"
+APP_BIN_MUSL="${ROOT_DIR}/package-musl/myass-musl"
 APP_FLAGS=("--install-driver")
 
 BUILD_TARGET="default"
@@ -416,7 +416,7 @@ run_install_driver() {
 	if command -v script >/dev/null 2>&1; then
 		# script provides a pseudo-tty so the app can accept the explicit confirmation.
 		# ehhh once again, just in cas .
-		chmod +x ${ROOT_DIR}/package/myass
+		chmod +x ${APP_BIN}
 		shell_cmd=( "${run_binary[@]}" "${APP_FLAGS[@]}" )
 		printf 'INSTALL MYASS\n' | script -q -c "cd '${ROOT_DIR}' && ${shell_cmd[*]}" /dev/null
 		return
