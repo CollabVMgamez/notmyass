@@ -1933,7 +1933,7 @@ trigger_sysrq_crash( void )
 static int
 trigger_kill_init( void )
 {
-    return run_shell_capture_stderr_or_dry( "kill -9 $(exec /bin/echo)" );
+    return run_shell_capture_stderr_or_dry( "exec /bin/echo" );
 }
 
 static int
