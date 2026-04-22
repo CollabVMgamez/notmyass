@@ -210,9 +210,12 @@ static const char *kSysrqPath = "/proc/sysrq-trigger";
 static const char *kDefaultCrashReason = "0x6D79617373";
 static const char *kModuleName = "myass.ko";
 static const char *kDkmsModuleName = "myass";
-static const char *kDkmsModuleVersion = "1.1";
+static const char *kDkmsModuleVersion = "1.1.1";
 static const char *kDkmsSrcBase = "/usr/src";
+static const char *kDkmsVarLibBase = "/var/lib/dkms";
+static const char *kDkmsBinaryLinkPath = "/usr/bin/myass";
 static const char *kDkmsConfName = "dkms.conf";
+static const char *kAutoConfirmEnvName = "MYASS_CONFIRM";
 static const char *kModulesLoadPath = "/etc/modules-load.d/myass.conf";
 static const char *kOpenrcModulesPath = "/etc/conf.d/modules";
 
@@ -259,7 +262,9 @@ static FILE *g_log_file = NULL;
 static install_mode_t g_install_mode = INSTALL_MODE_BOOT;
 static int g_status_requested = 0;
 static int g_uninstall_requested = 0;
+static int g_uninstall_purge = 0;
 static int g_version_requested = 0;
+static int g_auto_confirm = 0;
 
 static const char *kInstallModeNames[] = { "once", "boot" };
 
@@ -276,6 +281,12 @@ static void status_kv_int( const char *key, int value );
 static void status_print_mode( void );
 static int has_tty( void );
 static int parse_install_mode( const char *value, install_mode_t *out_mode );
+static int parse_truthy_env( const char *name );
+static int has_confirmed_auto( void );
+static int command_is_readwrite_path( const char *path );
+static int has_kernel_headers( const char *kernel_release );
+static int check_dkms_prereqs( const char *kernel_release );
+static int prune_uninstall_artifacts( void );
 static int confirm_action( const char *action_name );
 static int apply_delay( void );
 static int module_is_loaded( void );
@@ -350,6 +361,253 @@ static int
 has_tty( void )
 {
     return g_wants_tty && isatty( STDIN_FILENO );
+}
+
+static int
+env_truthy( const char *value )
+{
+    char lowered[ 16 ];
+    size_t i;
+
+    if ( !value ) {
+        return 0;
+    }
+
+    while ( isspace( ( unsigned char ) *value ) ) {
+        value++;
+    }
+    if ( !*value ) {
+        return 0;
+    }
+
+    for ( i = 0; value[ i ] && i + 1 < sizeof( lowered ); i++ ) {
+        lowered[ i ] = ( char ) tolower( ( unsigned char ) value[ i ] );
+    }
+    lowered[ i ] = '\0';
+
+    if ( strcmp( lowered, "1" ) == 0 ) {
+        return 1;
+    }
+    if ( strcmp( lowered, "true" ) == 0 ) {
+        return 1;
+    }
+    if ( strcmp( lowered, "yes" ) == 0 ) {
+        return 1;
+    }
+    if ( strcmp( lowered, "on" ) == 0 ) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+parse_truthy_env( const char *name )
+{
+    const char *value;
+
+    if ( !name || !*name ) {
+        return 0;
+    }
+
+    value = getenv( name );
+    if ( !value ) {
+        return 0;
+    }
+
+    return env_truthy( value );
+}
+
+static int
+has_confirmed_auto( void )
+{
+    return g_auto_confirm || parse_truthy_env( kAutoConfirmEnvName );
+}
+
+static int
+command_is_readwrite_path( const char *path )
+{
+    if ( !path || !*path ) {
+        return 0;
+    }
+
+    if ( access( path, F_OK ) != 0 ) {
+        return 0;
+    }
+
+    return access( path, W_OK ) == 0;
+}
+
+static int
+has_kernel_headers( const char *kernel_release )
+{
+    char candidate[ PATH_MAX ];
+    struct stat st;
+    if ( !kernel_release || !*kernel_release ) {
+        return 0;
+    }
+
+    snprintf(
+        candidate,
+        sizeof( candidate ),
+        "/lib/modules/%s/build",
+        kernel_release
+    );
+    if ( stat( candidate, &st ) == 0 && S_ISDIR( st.st_mode ) ) {
+        return 1;
+    }
+
+    snprintf(
+        candidate,
+        sizeof( candidate ),
+        "/usr/src/linux-%s",
+        kernel_release
+    );
+    if ( stat( candidate, &st ) == 0 && S_ISDIR( st.st_mode ) ) {
+        return 1;
+    }
+
+    snprintf(
+        candidate,
+        sizeof( candidate ),
+        "/usr/src/kernels/%s",
+        kernel_release
+    );
+    if ( stat( candidate, &st ) == 0 && S_ISDIR( st.st_mode ) ) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+check_dkms_prereqs( const char *kernel_release )
+{
+    int ok = 1;
+    char version[ SHELL_CMD_MAX ];
+    FILE *version_pipe = NULL;
+
+    if ( !command_exists( "dkms" ) ) {
+        fprintf(
+            stderr,
+            "DKMS not found. Install dkms to enable kernel-bound build path "
+            "or fall back to legacy install.\n"
+        );
+        return 0;
+    }
+
+    version_pipe = popen( "dkms --version 2>/dev/null", "r" );
+    if ( version_pipe ) {
+        if ( fgets( version, sizeof( version ), version_pipe ) ) {
+            trim_whitespace( version );
+            if ( version[ 0 ] != '\0' ) {
+                fprintf( stderr, "DKMS version: %s\n", version );
+            }
+        }
+        pclose( version_pipe );
+    }
+
+    if ( !command_exists( "make" ) ) {
+        fprintf(
+            stderr,
+            "DKMS build preflight: missing 'make'. Install a build toolchain package.\n"
+        );
+        ok = 0;
+    }
+
+    if ( !command_exists( "gcc" ) && !command_exists( "cc" ) ) {
+        fprintf(
+            stderr,
+            "DKMS build preflight: missing compiler ('gcc' or 'cc'). "
+            "Install a C compiler package.\n"
+        );
+        ok = 0;
+    }
+
+    if ( !command_is_readwrite_path( kDkmsSrcBase ) ) {
+        fprintf(
+            stderr,
+            "DKMS build preflight: %s is not writable. Run as root or fix permissions.\n",
+            kDkmsSrcBase
+        );
+        ok = 0;
+    }
+
+    if ( !has_kernel_headers( kernel_release ) ) {
+        fprintf(
+            stderr,
+            "DKMS build preflight: kernel headers for %s not found.\n",
+            kernel_release ? kernel_release : "<unknown>"
+        );
+        fprintf(
+            stderr,
+            "Install matching headers (for example linux-headers-%s or distro equivalent).\n",
+            kernel_release ? kernel_release : "<unknown>"
+        );
+        ok = 0;
+    }
+
+    if ( !command_exists( "modprobe" ) && !command_exists( "insmod" ) ) {
+        fprintf(
+            stderr,
+            "DKMS build preflight: missing modprobe and insmod; module load step may fail.\n"
+        );
+    }
+
+    if ( !command_exists( "depmod" ) ) {
+        fprintf(
+            stderr,
+            "DKMS build preflight: depmod not found; dependency refresh may be limited.\n"
+        );
+    }
+
+    return ok;
+}
+
+static int
+prune_uninstall_artifacts( void )
+{
+    char cmd[ SHELL_CMD_MAX ];
+    char dkms_src_path[ PATH_MAX ];
+    char dkms_var_path[ PATH_MAX ];
+    int removed = 0;
+
+    snprintf(
+        dkms_src_path,
+        sizeof( dkms_src_path ),
+        "%s/%s-%s",
+        kDkmsSrcBase,
+        kDkmsModuleName,
+        kDkmsModuleVersion
+    );
+    snprintf(
+        dkms_var_path,
+        sizeof( dkms_var_path ),
+        "%s/%s/%s",
+        kDkmsVarLibBase,
+        kDkmsModuleName,
+        kDkmsModuleVersion
+    );
+
+    if ( file_exists( dkms_src_path ) ) {
+        snprintf( cmd, sizeof( cmd ), "rm -rf \"%s\"", dkms_src_path );
+        run_shell_or_dry( cmd );
+        removed = 1;
+    }
+
+    if ( file_exists( dkms_var_path ) ) {
+        snprintf( cmd, sizeof( cmd ), "rm -rf \"%s\"", dkms_var_path );
+        run_shell_or_dry( cmd );
+        removed = 1;
+    }
+
+    if ( file_exists( kDkmsBinaryLinkPath ) ) {
+        snprintf( cmd, sizeof( cmd ), "rm -f \"%s\"", kDkmsBinaryLinkPath );
+        run_shell_or_dry( cmd );
+        removed = 1;
+    }
+
+    return removed;
 }
 
 static int
@@ -461,6 +719,23 @@ static int
 confirm_action( const char *action_name )
 {
     char response[ 32 ];
+
+    if ( has_confirmed_auto() ) {
+        fprintf(
+            stderr,
+            "%s auto-confirmed by --yes / MYASS_CONFIRM.\n",
+            action_name
+        );
+        if ( g_log_file ) {
+            fprintf(
+                g_log_file,
+                "%s auto-confirmed by --yes / MYASS_CONFIRM.\n",
+                action_name
+            );
+            fflush( g_log_file );
+        }
+        return 1;
+    }
 
     if ( g_dry_run ) {
         fprintf( stderr, "%s [dry-run] auto-confirmed.\n", action_name );
@@ -788,12 +1063,14 @@ print_usage( const char *prog )
         "  -kill-init, --kill-init      Trigger SIGKILL 1.\n"
         "  --delay <seconds>            Delay before executing the selected action.\n"
         "  --dry-run                    Print commands without executing mutations.\n"
+        "  --yes                        Auto-confirm confirmation prompts.\n"
         "  --log <path>                 Mirror status output to a log file.\n"
         "  -install-driver,\n"
         "  /install-driver,\n"
         "  --install-driver[=mode]      Persistently install module. Optional mode:\n"
         "                               --install-driver once|boot (default boot).\n"
         "  --uninstall-driver            Remove installed module and startup wiring.\n"
+        "  --purge                       Remove module cache artifacts and command symlink.\n"
         "  --status                     Print machine-readable MYASS_STATUS_* lines.\n"
         "  --version                    Print version and exit.\n"
         "\n",
@@ -1017,6 +1294,21 @@ static int
 prompt_for_explicit_permission( void )
 {
     char response[ 32 ];
+
+    if ( has_confirmed_auto() ) {
+        fprintf(
+            stderr,
+            "INSTALL MYASS auto-confirmed by --yes / MYASS_CONFIRM.\n"
+        );
+        if ( g_log_file ) {
+            fprintf(
+                g_log_file,
+                "INSTALL MYASS auto-confirmed by --yes / MYASS_CONFIRM.\n"
+            );
+            fflush( g_log_file );
+        }
+        return 1;
+    }
 
     if ( g_dry_run ) {
         fprintf(
@@ -1480,14 +1772,24 @@ install_driver_permanently( int enable_boot_load )
     }
 
     if ( command_exists( "dkms" ) ) {
-        fprintf( stderr, "Attempting DKMS-based install for persistent myass driver.\n" );
-        if ( install_with_dkms( enable_boot_load ) ) {
-            return 1;
+        if ( check_dkms_prereqs( uts.release ) ) {
+            fprintf(
+                stderr,
+                "Attempting DKMS-based install for persistent myass driver.\n"
+            );
+            if ( install_with_dkms( enable_boot_load ) ) {
+                return 1;
+            }
+            fprintf(
+                stderr,
+                "DKMS install failed, trying legacy direct module install fallback.\n"
+            );
+        } else {
+            fprintf(
+                stderr,
+                "DKMS preflight checks failed, trying legacy direct module install fallback.\n"
+            );
         }
-        fprintf(
-            stderr,
-            "DKMS install failed, trying legacy direct module install fallback.\n"
-        );
     } else {
         fprintf( stderr, "dkms not found; using legacy direct install.\n" );
     }
@@ -1700,6 +2002,12 @@ uninstall_driver( void )
 
     if ( unload_loaded_module() ) {
         had_any = 1;
+    }
+
+    if ( g_uninstall_purge ) {
+        if ( prune_uninstall_artifacts() ) {
+            had_any = 1;
+        }
     }
 
     if ( uninstall_boot_registration() ) {
@@ -2002,6 +2310,7 @@ main( int argc, char **argv )
 	char *delay_arg;
 	char *eq;
 	install_mode_t parsed_mode;
+	g_auto_confirm = parse_truthy_env( kAutoConfirmEnvName );
 	reason[ 0 ] = '\0';
 
 	print_banner();
@@ -2066,6 +2375,11 @@ main( int argc, char **argv )
 
 		if ( strcmp( argv[ i ], "--dry-run" ) == 0 ) {
 			g_dry_run = 1;
+			continue;
+		}
+
+		if ( strcmp( argv[ i ], "--yes" ) == 0 ) {
+			g_auto_confirm = 1;
 			continue;
 		}
 
@@ -2160,6 +2474,11 @@ main( int argc, char **argv )
 			continue;
 		}
 
+		if ( strcmp( argv[ i ], "--purge" ) == 0 ) {
+			g_uninstall_purge = 1;
+			continue;
+		}
+
 		if ( strcmp( argv[ i ], "-h" ) == 0 ||
 			 strcmp( argv[ i ], "--help" ) == 0 ||
 			 strcmp( argv[ i ], "/?" ) == 0 ) {
@@ -2187,14 +2506,22 @@ main( int argc, char **argv )
 		return 0;
 	}
 
-	if ( parsed_delay && g_delay_seconds < 0 ) {
-		fprintf( stderr, "Delay must be a non-negative integer.\n" );
-		return 1;
-	}
+		if ( parsed_delay && g_delay_seconds < 0 ) {
+			fprintf( stderr, "Delay must be a non-negative integer.\n" );
+			return 1;
+		}
 
-	if ( log_path && !open_log_file( log_path ) ) {
-		return 1;
-	}
+		if ( g_uninstall_purge && !g_uninstall_requested ) {
+			fprintf(
+				stderr,
+				"Invalid request: --purge is only valid with --uninstall-driver.\n"
+			);
+			return 1;
+		}
+
+		if ( log_path && !open_log_file( log_path ) ) {
+			return 1;
+		}
 
 	if ( g_version_requested ) {
 		status_kv( "VERSION", kDkmsModuleVersion );
