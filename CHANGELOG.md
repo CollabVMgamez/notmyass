@@ -2,6 +2,22 @@
 
 All notable changes to Not My ASS are documented here.
 
+## 1.1.1
+
+### Added
+
+- Bumped release marker and `--version` output to `1.1.1`.
+- Added `--yes` and `MYASS_CONFIRM=1` to automate confirmation prompts for install/uninstall flows.
+- Added `--uninstall-driver --purge` to remove versioned DKMS/cache artifacts and `/usr/bin/myass`.
+
+### Changed
+
+- Added DKMS install preflight checks with explicit diagnostics for:
+  - kernel release detection
+  - header availability
+  - `/usr/src` write access
+  - DKMS and build-tool prerequisites
+
 ## 1.1.0 (in beta testing)
 
 ### Added
