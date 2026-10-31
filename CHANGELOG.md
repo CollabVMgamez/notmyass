@@ -2,6 +2,11 @@
 
 All notable changes to Not My ASS are documented here.
 
+## 1.1.2
+
+### Added
+- notjacobxi OS support (void linux)
+
 ## 1.1.1
 
 ### Added
