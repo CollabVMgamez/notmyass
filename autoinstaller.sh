@@ -19,6 +19,7 @@ DEFAULT_DNF_PKGS=("gcc" "make" "git" "pkgconf-pkg-config" "libX11-devel" "dkms" 
 DEFAULT_YUM_PKGS=("gcc" "make" "git" "pkgconfig" "libX11-devel" "dkms" "kmod" "which" "bash" "util-linux")
 DEFAULT_ZYPPER_PKGS=("gcc" "make" "git" "pkg-config" "libX11-devel" "dkms" "kmod" "util-linux" "bash")
 DEFAULT_PACMAN_PKGS=("base-devel" "git" "pkgconf" "libx11" "dkms" "kmod" "bash" "util-linux" "linux-lts-headers")
+DEFAULT_XBPS_PKGS=("base-devel" "git" "pkg-config" "libX11-devel" "dkms" "kmod" "bash" "util-linux")
 DEFAULT_TINYCORE_PKGS=("bash" "binutils" "coreutils" "make" "gcc" "git" "patch" "grep" "sed" "linux-headers" "pkgconf")
 MUSL_TINYCORE_PKGS=("musl" "musl-tools" "linux-headers" "make")
 MUSL_APT_PKGS=("musl-tools" "musl-dev")
@@ -96,6 +97,11 @@ select_build_profile() {
 }
 
 detect_package_manager() {
+	if command -v xbps-install >/dev/null 2>&1; then
+		PACKAGE_MANAGER="xbps"
+		return
+	fi
+
 	if command -v apt-get >/dev/null 2>&1; then
 		PACKAGE_MANAGER="apt"
 		return
@@ -231,6 +237,21 @@ pacman_install_headers_pkg() {
 	echo "linux-headers"
 }
 
+xbps_install_headers_pkg() {
+	local kernel_release
+	kernel_release="$(uname -r)"
+	# Keep an existing build tree, including headers for a custom kernel.
+	if [ -f "/lib/modules/${kernel_release}/build/Makefile" ]; then
+		return 0
+	fi
+	if [[ "${kernel_release}" =~ ^([0-9]+)\.([0-9]+)\. ]]; then
+		printf 'linux%s.%s-headers\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+	else
+		echo "Cannot determine Void kernel headers for ${kernel_release}; install matching headers manually." >&2
+		return 1
+	fi
+}
+
 install_dependencies() {
 	local pkg_manager="$1"
 	local -a pkgs=()
@@ -284,6 +305,23 @@ install_dependencies() {
 	}
 
 	case "${pkg_manager}" in
+		xbps)
+			pkgs=("${DEFAULT_XBPS_PKGS[@]}")
+			header_pkg="$(xbps_install_headers_pkg)"
+			if [ -n "${header_pkg}" ]; then
+				pkgs+=("${header_pkg}")
+			fi
+			if [ "${BUILD_TARGET}" = "musl" ] && ! is_musl_environment; then
+				echo "Void glibc needs an external musl toolchain for --musl; use native Void musl or omit --musl." >&2
+				return 1
+			fi
+			run_as_root xbps-install -Sy "${pkgs[@]}"
+			if [ ! -f "/lib/modules/$(uname -r)/build/Makefile" ]; then
+				echo "Headers for the running kernel $(uname -r) are unavailable." >&2
+				echo "Install matching headers, or update your kernel and reboot into it, then rerun this installer." >&2
+				return 1
+			fi
+			;;
 		apt)
 			pkgs=("${DEFAULT_APT_PKGS[@]}")
 			header_pkg="$(apt_install_headers_pkg)"
@@ -356,7 +394,7 @@ install_dependencies() {
 			;;
 		*)
 			echo "Unsupported package manager; skipping automatic dependency installation." >&2
-			echo "Known: apt, apk, dnf, yum, zypper, pacman, tinycore (tce-load)." >&2
+			echo "Known: apt, apk, dnf, yum, zypper, pacman, xbps, tinycore (tce-load)." >&2
 			echo "Install equivalent packages manually, then rerun the script." >&2
 			return
 			;;
@@ -387,7 +425,13 @@ build_project() {
 	pushd "${ROOT_DIR}" >/dev/null
 	if [ "${BUILD_TARGET}" = "musl" ]; then
 		echo "Building musl binary and module..."
-		MUSL_CC="${MUSL_CC}" make musl
+		if [ "${PACKAGE_MANAGER}" = "xbps" ]; then
+			# Native Void musl supports X11 through shared libraries; static
+			# archives for all X11 dependencies need not be installed.
+			MUSL_CC="${MUSL_CC}" make musl MUSL_LDFLAGS_EXTRA=
+		else
+			MUSL_CC="${MUSL_CC}" make musl
+		fi
 	else
 		echo "Building default binary and module..."
 		make
